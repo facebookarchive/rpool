@@ -27,7 +27,7 @@ type Pool struct {
 	CloseErrorHandler func(err error)
 
 	// Stats is optional and allows for the pool to provide stats for various
-	// interesting events in the proxy.
+	// interesting events in the pool.
 	Stats stats.Client
 
 	// Max defines the maximum number of concurrently allocated resources.
