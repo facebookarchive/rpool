@@ -13,6 +13,8 @@ import (
 	"github.com/facebookgo/stats"
 )
 
+var errWrongPool = errors.New("rpool: provided resource was not acquired from this pool")
+
 type resource struct {
 	resourceMaker *resourceMaker
 }
@@ -422,4 +424,57 @@ func TestIdleClose(t *testing.T) {
 	ensure.Nil(t, p.Close())
 	ensure.DeepEqual(t, atomic.LoadInt32(&cm.newCount), int32(max))
 	ensure.DeepEqual(t, atomic.LoadInt32(&cm.closeCount), int32(max))
+}
+
+func TestReleaseInvalid(t *testing.T) {
+	t.Parallel()
+	defer ensure.PanicDeepEqual(t, errWrongPool)
+	var cm resourceMaker
+	p := rpool.Pool{
+		New:           cm.New,
+		Max:           1,
+		MinIdle:       1,
+		IdleTimeout:   time.Hour,
+		ClosePoolSize: 1,
+	}
+	r, err := cm.New()
+	ensure.Nil(t, err)
+	p.Release(r)
+}
+
+func TestDiscardInvalid(t *testing.T) {
+	t.Parallel()
+	defer ensure.PanicDeepEqual(t, errWrongPool)
+	var cm resourceMaker
+	p := rpool.Pool{
+		New:           cm.New,
+		Max:           1,
+		MinIdle:       1,
+		IdleTimeout:   time.Hour,
+		ClosePoolSize: 1,
+	}
+	r, err := cm.New()
+	ensure.Nil(t, err)
+	p.Discard(r)
+}
+
+func TestMaxUndefined(t *testing.T) {
+	t.Parallel()
+	defer ensure.PanicDeepEqual(t, "no max configured")
+	(&rpool.Pool{}).Acquire()
+}
+
+func TestIdleTimeoutUndefined(t *testing.T) {
+	t.Parallel()
+	defer ensure.PanicDeepEqual(t, "no idle timeout configured")
+	(&rpool.Pool{Max: 1}).Acquire()
+}
+
+func TestClosePoolSizeUndefined(t *testing.T) {
+	t.Parallel()
+	defer ensure.PanicDeepEqual(t, "no close pool size configured")
+	(&rpool.Pool{
+		Max:         1,
+		IdleTimeout: time.Second,
+	}).Acquire()
 }

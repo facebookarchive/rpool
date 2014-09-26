@@ -14,6 +14,7 @@ import (
 var (
 	errPoolClosed  = errors.New("rpool: pool has been closed")
 	errCloseAgain  = errors.New("rpool: Pool.Close called more than once")
+	errWrongPool   = errors.New("rpool: provided resource was not acquired from this pool")
 	closedSentinel = sentinelCloser(1)
 	newSentinel    = sentinelCloser(2)
 )
@@ -47,10 +48,10 @@ type Pool struct {
 
 	manageOnce sync.Once
 	acquire    chan chan io.Closer
-	release    chan io.Closer
-	discard    chan struct{}
+	new        chan io.Closer
+	release    chan returnResource
+	discard    chan returnResource
 	close      chan chan error
-	closers    chan io.Closer
 }
 
 // Acquire will pull a resource from the pool or create a new one if necessary.
@@ -75,7 +76,9 @@ func (p *Pool) Acquire() (io.Closer, error) {
 		if err != nil {
 			stats.BumpSum(p.Stats, "acquire.error.new", 1)
 			// discard our assumed checked out resource since we failed to New
-			p.discard <- struct{}{}
+			p.discard <- returnResource{resource: newSentinel}
+		} else {
+			p.new <- c
 		}
 		return c, err
 	}
@@ -84,17 +87,32 @@ func (p *Pool) Acquire() (io.Closer, error) {
 	return c, nil
 }
 
-// Release puts the resource back into the pool.
+// Release puts the resource back into the pool. It will panic if you try to
+// release a resource that wasn't acquired from this pool.
 func (p *Pool) Release(c io.Closer) {
 	p.manageOnce.Do(p.goManage)
-	p.release <- c
+
+	// we get an error back and panic here instead of the manage function so the
+	// caller gets the panic and we end up with a useful stack.
+	res := make(chan error)
+	p.release <- returnResource{resource: c, response: res}
+	if err := <-res; err != nil {
+		panic(err)
+	}
 }
 
-// Discard closes the resource and indicates we're throwing it away.
+// Discard closes the resource and indicates we're throwing it away. It will
+// panic if you try to discard a resource that wasn't acquired from this pool.
 func (p *Pool) Discard(c io.Closer) {
 	p.manageOnce.Do(p.goManage)
-	p.closers <- c
-	p.discard <- struct{}{}
+
+	// we get an error back and panic here instead of the manage function so the
+	// caller gets the panic and we end up with a useful stack.
+	res := make(chan error)
+	p.discard <- returnResource{resource: c, response: res}
+	if err := <-res; err != nil {
+		panic(err)
+	}
 }
 
 // Close closes the pool and its resources. It waits until all acquired
@@ -119,11 +137,11 @@ func (p *Pool) goManage() {
 		panic("no close pool size configured")
 	}
 
-	p.release = make(chan io.Closer)
 	p.acquire = make(chan chan io.Closer)
-	p.discard = make(chan struct{})
+	p.new = make(chan io.Closer)
+	p.release = make(chan returnResource)
+	p.discard = make(chan returnResource)
 	p.close = make(chan chan error)
-	p.closers = make(chan io.Closer, p.Max)
 	go p.manage()
 }
 
@@ -134,12 +152,13 @@ type entry struct {
 
 func (p *Pool) manage() {
 	// setup goroutines to close resources
+	closers := make(chan io.Closer)
 	var closeWG sync.WaitGroup
 	closeWG.Add(int(p.ClosePoolSize))
 	for i := uint(0); i < p.ClosePoolSize; i++ {
 		go func() {
 			defer closeWG.Done()
-			for c := range p.closers {
+			for c := range closers {
 				t := stats.BumpTime(p.Stats, "close.time")
 				stats.BumpSum(p.Stats, "close", 1)
 				if err := c.Close(); err != nil {
@@ -159,6 +178,7 @@ func (p *Pool) manage() {
 	}
 
 	resources := []entry{}
+	outResources := map[io.Closer]struct{}{}
 	out := uint(0)
 	waiting := list.New()
 	idleTicker := time.NewTicker(p.IdleTimeout)
@@ -172,11 +192,12 @@ func (p *Pool) manage() {
 
 			// all waiting acquires are done, all resources have been released.
 			// now just wait for all resources to close.
-			close(p.closers)
+			close(closers)
 			closeWG.Wait()
 
 			// close internal channels.
 			close(p.acquire)
+			close(p.new)
 			close(p.release)
 			close(p.discard)
 			close(p.close)
@@ -199,6 +220,7 @@ func (p *Pool) manage() {
 			// acquire from pool
 			if cl := len(resources); cl > 0 {
 				c := resources[cl-1]
+				outResources[c.resource] = struct{}{}
 				r <- c.resource
 				resources = resources[:cl-1]
 				out++
@@ -218,30 +240,47 @@ func (p *Pool) manage() {
 			// creating a new resource fails.
 			out++
 			r <- newSentinel
-		case c := <-p.release:
+		case c := <-p.new:
+			outResources[c] = struct{}{}
+		case rr := <-p.release:
+			// ensure we're dealing with a resource acquired thru us
+			if _, found := outResources[rr.resource]; !found {
+				rr.response <- errWrongPool
+				return
+			}
+			close(rr.response)
+
 			// pass it to someone who's waiting
 			if e := waiting.Front(); e != nil {
 				r := waiting.Remove(e).(chan io.Closer)
-				r <- c
+				r <- rr.resource
 				continue
-			}
-
-			if out == 0 {
-				panic("releasing more than acquired")
 			}
 
 			// no longer out
 			out--
+			delete(outResources, rr.resource)
 
 			// no one is waiting, and we're closed, schedule it to be closed
 			if closed {
-				p.closers <- c
+				closers <- rr.resource
 				continue
 			}
 
 			// put it back in our pool
-			resources = append(resources, entry{resource: c, use: time.Now()})
-		case <-p.discard:
+			resources = append(resources, entry{resource: rr.resource, use: time.Now()})
+		case rr := <-p.discard:
+			// ensure we're dealing with a resource acquired thru us
+			if rr.resource != newSentinel { // this happens when new fails
+				if _, found := outResources[rr.resource]; !found {
+					rr.response <- errWrongPool
+					return
+				}
+				close(rr.response)
+				delete(outResources, rr.resource)
+				closers <- rr.resource
+			}
+
 			// we can make a new one if someone is waiting. no need to decrement out
 			// in this case since we assume this new one is checked out. Acquire will
 			// discard if creating a new resource fails.
@@ -249,10 +288,6 @@ func (p *Pool) manage() {
 				r := waiting.Remove(e).(chan io.Closer)
 				r <- newSentinel
 				continue
-			}
-
-			if out == 0 {
-				panic("discarding more than acquired")
 			}
 
 			// otherwise we lost a resource and dont need a new one right away
@@ -273,7 +308,7 @@ func (p *Pool) manage() {
 				if now.Sub(e.use) < p.IdleTimeout {
 					break
 				}
-				p.closers <- e.resource
+				closers <- e.resource
 				idleLen++
 			}
 
@@ -300,12 +335,17 @@ func (p *Pool) manage() {
 
 			// close idle since if we have idle, implicitly no one is waiting
 			for _, e := range resources {
-				p.closers <- e.resource
+				closers <- e.resource
 			}
 
 			closeResponse = r
 		}
 	}
+}
+
+type returnResource struct {
+	resource io.Closer
+	response chan error
 }
 
 type sentinelCloser int
