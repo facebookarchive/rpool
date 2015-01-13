@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/facebookgo/clock"
 	"github.com/facebookgo/stats"
 )
 
@@ -45,6 +46,10 @@ type Pool struct {
 	// ClosePoolSize defines the number of concurrent goroutines that will close
 	// resources.
 	ClosePoolSize uint
+
+	// Clock allows for testing timing related functionality. Do not specify this
+	// in production code.
+	Clock clock.Clock
 
 	manageOnce sync.Once
 	acquire    chan chan io.Closer
@@ -151,6 +156,11 @@ type entry struct {
 }
 
 func (p *Pool) manage() {
+	klock := p.Clock
+	if klock == nil {
+		klock = clock.New()
+	}
+
 	// setup goroutines to close resources
 	closers := make(chan io.Closer)
 	var closeWG sync.WaitGroup
@@ -172,7 +182,7 @@ func (p *Pool) manage() {
 
 	// setup a ticker to report various averages every minute. if we don't have a
 	// Stats implementation provided, we Stop it so it never ticks.
-	statsTicker := time.NewTicker(time.Minute)
+	statsTicker := klock.Ticker(time.Minute)
 	if p.Stats == nil {
 		statsTicker.Stop()
 	}
@@ -181,7 +191,7 @@ func (p *Pool) manage() {
 	outResources := map[io.Closer]struct{}{}
 	out := uint(0)
 	waiting := list.New()
-	idleTicker := time.NewTicker(p.IdleTimeout)
+	idleTicker := klock.Ticker(p.IdleTimeout)
 	closed := false
 	var closeResponse chan error
 	for {
@@ -268,7 +278,7 @@ func (p *Pool) manage() {
 			}
 
 			// put it back in our pool
-			resources = append(resources, entry{resource: rr.resource, use: time.Now()})
+			resources = append(resources, entry{resource: rr.resource, use: klock.Now()})
 		case rr := <-p.discard:
 			// ensure we're dealing with a resource acquired thru us
 			if rr.resource != newSentinel { // this happens when new fails

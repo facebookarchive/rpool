@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/facebookgo/clock"
 	"github.com/facebookgo/ensure"
 	"github.com/facebookgo/rpool"
 	"github.com/facebookgo/stats"
@@ -381,6 +382,8 @@ func TestIdleClose(t *testing.T) {
 		minIdle = 2
 	)
 
+	klock := clock.NewMock()
+
 	// we going to wait until stats shows we closed enough idle
 	statsDone := make(chan struct{})
 	expectedIdleClosed := int32(max - minIdle)
@@ -400,8 +403,9 @@ func TestIdleClose(t *testing.T) {
 		Stats:         hc,
 		Max:           max,
 		MinIdle:       minIdle,
-		IdleTimeout:   time.Millisecond,
+		IdleTimeout:   time.Second,
 		ClosePoolSize: 2,
+		Clock:         klock,
 	}
 
 	// acquire and release some resources to make them idle
@@ -411,15 +415,25 @@ func TestIdleClose(t *testing.T) {
 		ensure.Nil(t, err)
 		resources = append(resources, r)
 	}
+
+	// this will be used as the "last use" time
+	klock.Add(p.IdleTimeout / 2)
+
 	for _, r := range resources {
 		p.Release(r)
 	}
 
+	// tick another IdleTimeout / 2 to hit the 0 eligible case
+	klock.Add(p.IdleTimeout / 2)
+
+	// tick another IdleTimeout to make them eligible
+	klock.Add(p.IdleTimeout)
+
 	// stats should soon show idle closed
 	<-statsDone
 
-	// to ensure we hit the 0 eligible case
-	time.Sleep(10 * time.Millisecond)
+	// tick another IdleTimeout to hit the eligibleOffset check
+	klock.Add(p.IdleTimeout)
 
 	ensure.Nil(t, p.Close())
 	ensure.DeepEqual(t, atomic.LoadInt32(&cm.newCount), int32(max))
@@ -477,4 +491,64 @@ func TestClosePoolSizeUndefined(t *testing.T) {
 		Max:         1,
 		IdleTimeout: time.Second,
 	}).Acquire()
+}
+
+func TestStatsTicker(t *testing.T) {
+	t.Parallel()
+
+	klock := clock.NewMock()
+	expected := []string{"alive", "idle", "out", "waiting"}
+
+	statsDone := make(chan string, 4)
+	hc := &stats.HookClient{
+		BumpAvgHook: func(key string, val float64) {
+			if contains(expected, key) {
+				statsDone <- key
+			}
+		},
+	}
+
+	var cm resourceMaker
+	p := rpool.Pool{
+		New:           cm.New,
+		Stats:         hc,
+		Max:           4,
+		MinIdle:       2,
+		IdleTimeout:   time.Second,
+		ClosePoolSize: 2,
+		Clock:         klock,
+	}
+
+	// acquire and release some resources to make them idle
+	var resources []io.Closer
+	for i := p.Max; i > 0; i-- {
+		r, err := p.Acquire()
+		ensure.Nil(t, err)
+		resources = append(resources, r)
+	}
+	for _, r := range resources {
+		p.Release(r)
+	}
+
+	// tick IdleTimeout to make them eligible
+	klock.Add(p.IdleTimeout)
+
+	// tick Minute to trigger stats
+	klock.Add(time.Minute)
+
+	// stats should soon show idle closed
+	ensure.SameElements(
+		t,
+		[]string{<-statsDone, <-statsDone, <-statsDone, <-statsDone},
+		expected,
+	)
+}
+
+func contains(set []string, key string) bool {
+	for _, v := range set {
+		if v == key {
+			return true
+		}
+	}
+	return false
 }
